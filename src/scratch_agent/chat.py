@@ -1,7 +1,12 @@
-"""Day 2: streaming output.
+"""Day 3: first tool (read_file) and the agent loop.
 
-Streaming events arrive one by one. We reconstruct the full content blocks
-from the deltas and store them in `messages` at the end.
+The agent loop is the core of every agent:
+    while stop_reason == "tool_use":
+        execute tools
+        send tool_result back
+        get next response
+
+When stop_reason is "end_turn", the model has nothing more to do and we're done.
 """
 
 import sys
@@ -10,6 +15,7 @@ from typing import Any
 from anthropic import Anthropic
 
 from .config import Config
+from .tools import TOOL_FUNCTIONS, TOOLS
 
 EXIT_COMMANDS = {"/exit", "/quit"}
 
@@ -35,13 +41,19 @@ def print_stream(stream) -> tuple[list[dict[str, Any]], str, dict[str, int]]:
             case "message_start":
                 usage["input_tokens"] = event.message.usage.input_tokens
             case "content_block_start":
-                content_blocks.append({"type": event.content_block.type})
-                match event.content_block.type:
+                block_type = event.content_block.type
+                content_blocks.append({"type": block_type})
+                match block_type:
                     case "text":
                         content_blocks[-1]["text"] = ""
                     case "thinking":
                         content_blocks[-1]["thinking"] = ""
                         print("💭 ", end="", flush=True)
+                    case "tool_use":
+                        # tool_use block has: id, name, input (input arrives as deltas)
+                        content_blocks[-1]["id"] = event.content_block.id
+                        content_blocks[-1]["name"] = event.content_block.name
+                        content_blocks[-1]["input"] = {}
             case "content_block_delta":
                 delta = event.delta
                 match delta.type:
@@ -51,9 +63,22 @@ def print_stream(stream) -> tuple[list[dict[str, Any]], str, dict[str, int]]:
                     case "thinking_delta":
                         content_blocks[-1]["thinking"] += delta.thinking
                         print(delta.thinking, end="", flush=True)
+                    case "input_json_delta":
+                        # input_json_delta sends raw JSON string fragments.
+                        # We'll parse the complete JSON after the block stops.
+                        if "input_json" not in content_blocks[-1]:
+                            content_blocks[-1]["input_json"] = ""
+                        content_blocks[-1]["input_json"] += delta.partial_json
             case "content_block_stop":
                 if content_blocks[-1]["type"] == "thinking":
                     print()  # newline after thinking block
+                elif content_blocks[-1]["type"] == "tool_use":
+                    # Parse the accumulated JSON string into the input dict
+                    import json
+                    json_str = content_blocks[-1].pop("input_json", "{}")
+                    content_blocks[-1]["input"] = json.loads(json_str)
+                    tool_name = content_blocks[-1]["name"]
+                    print(f"🔧 {tool_name}({content_blocks[-1]['input']})")
             case "message_delta":
                 stop_reason = event.delta.stop_reason
                 usage["output_tokens"] = event.usage.output_tokens
@@ -85,20 +110,74 @@ def chat_loop(client: Anthropic, config: Config) -> None:
             continue
 
         messages.append({"role": "user", "content": user_input})
-        try:
-            with client.messages.stream(
-                model=config.model,
-                max_tokens=config.max_tokens,
-                messages=messages,
-            ) as stream:
-                content_blocks, stop_reason, usage = print_stream(stream)
-        except Exception as e:
-            messages.pop()
-            print(f"[error] {type(e).__name__}: {e}", file=sys.stderr)
-            continue
 
-        messages.append({"role": "assistant", "content": content_blocks})
+        # Agent loop: keep going while the model wants to use tools.
+        total_usage = {"input_tokens": 0, "output_tokens": 0}
+        iteration = 0
+        max_iterations = 10  # prevent infinite loops
+
+        while iteration < max_iterations:
+            iteration += 1
+            try:
+                with client.messages.stream(
+                    model=config.model,
+                    max_tokens=config.max_tokens,
+                    messages=messages,
+                    tools=TOOLS,
+                ) as stream:
+                    content_blocks, stop_reason, usage = print_stream(stream)
+            except Exception as e:
+                if iteration == 1:
+                    messages.pop()  # drop the user turn if first iteration fails
+                print(f"[error] {type(e).__name__}: {e}", file=sys.stderr)
+                break
+
+            total_usage["input_tokens"] += usage["input_tokens"]
+            total_usage["output_tokens"] += usage["output_tokens"]
+
+            # Add the assistant's response to history
+            messages.append({"role": "assistant", "content": content_blocks})
+
+            if stop_reason == "end_turn":
+                # Model is done, no more tools to call
+                break
+            elif stop_reason == "tool_use":
+                # Execute all tool_use blocks and send results back
+                tool_results = []
+                for block in content_blocks:
+                    if block["type"] == "tool_use":
+                        tool_name = block["name"]
+                        tool_input = block["input"]
+                        tool_id = block["id"]
+
+                        if tool_name in TOOL_FUNCTIONS:
+                            try:
+                                result = TOOL_FUNCTIONS[tool_name](**tool_input)
+                            except Exception as e:
+                                result = f"Error executing {tool_name}: {type(e).__name__}: {e}"
+                        else:
+                            result = f"Error: unknown tool {tool_name}"
+
+                        tool_results.append({
+                            "type": "tool_result",
+                            "tool_use_id": tool_id,
+                            "content": result,
+                        })
+                        print(f"  → {len(result)} chars")
+
+                # Send tool results back to the model
+                messages.append({"role": "user", "content": tool_results})
+            elif stop_reason == "max_tokens":
+                print("[warning] hit max_tokens, response truncated")
+                break
+            else:
+                print(f"[warning] unexpected stop_reason: {stop_reason}")
+                break
+
+        if iteration >= max_iterations:
+            print(f"[warning] hit max_iterations ({max_iterations}), stopping")
+
         print(
-            f"[{stop_reason} | in={usage['input_tokens']} "
-            f"out={usage['output_tokens']} | turns={len(messages) // 2}]"
+            f"[{stop_reason} | in={total_usage['input_tokens']} "
+            f"out={total_usage['output_tokens']} | turns={len([m for m in messages if m['role'] == 'user' and isinstance(m['content'], str)])}]"
         )
