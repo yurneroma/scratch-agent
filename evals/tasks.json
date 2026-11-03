@@ -1,0 +1,81 @@
+{
+  "tasks": [
+    {
+      "id": "fix-add-function",
+      "prompt": "calculator.py has a bug in add(). Fix it so add(2, 3) returns 5. Keep the answer brief.",
+      "files": {
+        "calculator.py": "def add(a, b):\n    return a - b\n"
+      },
+      "required_tools": [],
+      "checks": {
+        "file_contains": {
+          "calculator.py": ["return a + b"]
+        },
+        "file_not_contains": {
+          "calculator.py": ["return a - b"]
+        }
+      }
+    },
+    {
+      "id": "locate-symbol",
+      "prompt": "Find the line where find_me is defined. Reply with exactly path:line, using the workspace-relative path.",
+      "files": {
+        "README.md": "# Fixture project\n",
+        "pkg/finder.py": "# Package helpers\n\ndef find_me():\n    return 'found'\n"
+      },
+      "required_tools": [],
+      "checks": {
+        "answer_contains": ["pkg/finder.py:3"]
+      }
+    },
+    {
+      "id": "precise-edit",
+      "prompt": "In settings.txt, change only Section B's value from target to changed. Section A must remain target.",
+      "files": {
+        "settings.txt": "Section A: target\nSection B: target\n"
+      },
+      "required_tools": [],
+      "checks": {
+        "file_contains": {
+          "settings.txt": [
+            "Section A: target\nSection B: changed"
+          ]
+        },
+        "file_not_contains": {
+          "settings.txt": ["Section B: target"]
+        }
+      }
+    },
+    {
+      "id": "create-greeting-module",
+      "prompt": "Create greet.py with a function greet(name) that returns 'Hello, ' + name + '!'. Keep the code simple.",
+      "files": {},
+      "required_tools": [],
+      "checks": {
+        "file_contains": {
+          "greet.py": [
+            "def greet(name):",
+            "return 'Hello, ' + name + '!'"
+          ]
+        }
+      }
+    },
+    {
+      "id": "run-check-and-fix",
+      "prompt": "Run python check.py, inspect the result, and fix the bug until python check.py exits successfully. Do not modify check.py.",
+      "files": {
+        "calculator.py": "def add(a, b):\n    return a - b\n",
+        "check.py": "from calculator import add\n\nactual = add(2, 3)\nexpected = 5\n\nif actual != expected:\n    print(f\"FAIL: add(2, 3) returned {actual}, expected {expected}\")\n    raise SystemExit(1)\n\nprint(\"PASS\")\n"
+      },
+      "required_tools": ["bash"],
+      "checks": {
+        "file_contains": {
+          "calculator.py": ["return a + b"]
+        },
+        "file_not_contains": {
+          "check.py": ["return a - b"]
+        }
+      }
+    }
+  ]
+}

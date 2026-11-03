@@ -1,5 +1,6 @@
 import tempfile
 import unittest
+import os
 from pathlib import Path
 from unittest import mock
 
@@ -46,6 +47,7 @@ class ToolTests(unittest.TestCase):
         self.assertIn("edit", schema_names)
         self.assertIn("glob", schema_names)
         self.assertIn("grep", schema_names)
+        self.assertIn("bash", schema_names)
 
     def test_paths_cannot_escape_workspace(self):
         with self.assertRaises(ValueError):
@@ -115,6 +117,76 @@ class ToolTests(unittest.TestCase):
 
         self.assertTrue(result.startswith("x" * 10))
         self.assertIn("[truncated: omitted 90 of 100 chars]", result)
+
+
+class BashToolTests(unittest.TestCase):
+    def setUp(self):
+        temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary_directory.cleanup)
+        self.root = Path(temporary_directory.name).resolve()
+        mock.patch.object(
+            tools,
+            "WORKSPACE_ROOT",
+            self.root,
+        ).start()
+        self.addCleanup(mock.patch.stopall)
+
+    def test_bash_returns_streams_exit_code_and_duration(self):
+        result = tools.bash("printf stdout; printf stderr >&2")
+
+        self.assertIn("exit_code: 0", result)
+        self.assertIn("duration:", result)
+        self.assertIn("stdout:\nstdout", result)
+        self.assertIn("stderr:\nstderr", result)
+
+    def test_bash_timeout_kills_process_group(self):
+        result = tools.bash("sleep 5", timeout=0.2)
+
+        self.assertIn("Error: command timed out after 0.2s", result)
+        self.assertIn("process group was killed", result)
+
+    def test_bash_removes_secret_environment_entries(self):
+        with mock.patch.dict(
+            os.environ,
+            {"SCRATCH_AGENT_TEST_API_KEY": "super-secret"},
+        ):
+            result = tools.bash("env")
+
+        self.assertNotIn("SCRATCH_AGENT_TEST_API_KEY", result)
+        self.assertNotIn("super-secret", result)
+
+    def test_bash_truncates_long_stream_output(self):
+        with (
+            mock.patch.object(tools, "MAX_BASH_STDOUT_CHARS", 10),
+            mock.patch.object(tools, "MAX_BASH_STDERR_CHARS", 5),
+        ):
+            result = tools.bash("printf 0123456789ABCDEF")
+
+        self.assertIn("[truncated: omitted 6 of 16 chars]", result)
+
+    def test_bash_requires_confirmation(self):
+        tool = tools.TOOL_LOOKUP["bash"]
+
+        self.assertTrue(tool.requires_confirmation)
+        self.assertIn("bash", tools.TOOL_FUNCTIONS)
+
+    def test_execute_tool_can_deny_bash(self):
+        result = tools.execute_tool(
+            "bash",
+            {"command": "printf never"},
+            confirm=lambda name, tool_input: False,
+        )
+
+        self.assertEqual(result, "Error: permission denied for bash")
+
+    def test_execute_tool_can_auto_approve_evaluations(self):
+        result = tools.execute_tool(
+            "bash",
+            {"command": "printf ok"},
+            auto_approve=True,
+        )
+
+        self.assertIn("stdout:\nok", result)
 
 
 if __name__ == "__main__":

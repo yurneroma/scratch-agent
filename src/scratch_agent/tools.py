@@ -5,6 +5,10 @@ The schema tells the model what tools exist and how to call them.
 """
 
 import re
+import os
+import signal
+import subprocess
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
@@ -15,6 +19,10 @@ from typing import Any, Callable
 MAX_TOOL_OUTPUT_CHARS = 20_000
 MAX_GLOB_RESULTS = 200
 MAX_GREP_RESULTS = 200
+DEFAULT_BASH_TIMEOUT_SECONDS = 10
+MAX_BASH_TIMEOUT_SECONDS = 30
+MAX_BASH_STDOUT_CHARS = 14_000
+MAX_BASH_STDERR_CHARS = 4_000
 
 # These directories are useful to humans and editors, but usually waste agent
 # context when searching a project.
@@ -31,6 +39,7 @@ class Tool:
     description: str
     input_schema: dict[str, Any]
     function: Callable[..., str]
+    requires_confirmation: bool = False
 
     def schema(self) -> dict[str, Any]:
         """Return the JSON schema sent to the model."""
@@ -41,13 +50,14 @@ class Tool:
         }
 
 
-def truncate_output(text: str) -> str:
+def truncate_output(text: str, max_chars: int | None = None) -> str:
     """Cap tool output so one large file or search cannot flood the context."""
-    if len(text) <= MAX_TOOL_OUTPUT_CHARS:
+    limit = MAX_TOOL_OUTPUT_CHARS if max_chars is None else max_chars
+    if len(text) <= limit:
         return text
-    omitted = len(text) - MAX_TOOL_OUTPUT_CHARS
+    omitted = len(text) - limit
     return (
-        text[:MAX_TOOL_OUTPUT_CHARS]
+        text[:limit]
         + f"\n... [truncated: omitted {omitted} of {len(text)} chars]"
     )
 
@@ -248,6 +258,100 @@ def grep(pattern: str, path: str = ".", include: str | None = None) -> str:
         return f"Error running grep: {type(e).__name__}: {e}"
 
 
+def sanitized_shell_environment() -> dict[str, str]:
+    """Return the environment for bash without obvious request secrets."""
+    environment = os.environ.copy()
+    secret_markers = ("KEY", "TOKEN", "SECRET", "PASSWORD")
+    for name in list(environment):
+        if any(marker in name.upper() for marker in secret_markers):
+            environment.pop(name, None)
+
+    # These entries can make a shell or interpreter run extra startup code.
+    for name in ("BASH_ENV", "ENV", "PYTHONSTARTUP", "NODE_OPTIONS", "ZDOTDIR"):
+        environment.pop(name, None)
+    return environment
+
+
+def bash(command: str, timeout: int = DEFAULT_BASH_TIMEOUT_SECONDS) -> str:
+    """Run a shell command in the workspace with a process-group timeout."""
+    started = time.monotonic()
+    if not command or not command.strip():
+        return "Error: command must not be empty"
+    if isinstance(timeout, bool) or not isinstance(timeout, (int, float)):
+        return f"Error: timeout must be a number, got {type(timeout).__name__}"
+    if timeout <= 0:
+        return "Error: timeout must be greater than zero"
+    if timeout > MAX_BASH_TIMEOUT_SECONDS:
+        return f"Error: timeout cannot exceed {MAX_BASH_TIMEOUT_SECONDS} seconds"
+
+    try:
+        process = subprocess.Popen(
+            command,
+            shell=True,
+            cwd=WORKSPACE_ROOT,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=sanitized_shell_environment(),
+            start_new_session=True,
+        )
+    except OSError as e:
+        return f"Error starting command: {type(e).__name__}: {e}"
+
+    try:
+        stdout, stderr = process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            process.kill()
+        stdout, stderr = process.communicate()
+        duration = time.monotonic() - started
+        return truncate_output(
+            "Error: command timed out "
+            f"after {timeout:g}s and the process group was killed\n\n"
+            f"exit_code: {process.returncode}\n"
+            f"duration: {duration:.2f}s\n\n"
+            f"stdout:\n{stdout or ''}\n\nstderr:\n{stderr or ''}"
+        )
+
+    duration = time.monotonic() - started
+    stdout_text = truncate_output(stdout or "", MAX_BASH_STDOUT_CHARS)
+    stderr_text = truncate_output(stderr or "", MAX_BASH_STDERR_CHARS)
+    return truncate_output(
+        f"exit_code: {process.returncode}\n"
+        f"duration: {duration:.2f}s\n\n"
+        f"stdout:\n{stdout_text}\n\nstderr:\n{stderr_text}"
+    )
+
+
+def execute_tool(
+    tool_name: str,
+    tool_input: dict[str, Any],
+    *,
+    confirm: Callable[[str, dict[str, Any]], bool] | None = None,
+    auto_approve: bool = False,
+) -> str:
+    """Execute a registry tool and apply its confirmation policy."""
+    tool = TOOL_LOOKUP.get(tool_name)
+    if tool is None:
+        return f"Error: unknown tool {tool_name}"
+
+    if tool.requires_confirmation and not auto_approve:
+        allowed = confirm is not None and confirm(tool_name, tool_input)
+        if not allowed:
+            return f"Error: permission denied for {tool_name}"
+
+    try:
+        return tool.function(**tool_input)
+    except TypeError as e:
+        return f"Error executing {tool_name}: {type(e).__name__}: {e}"
+    except Exception as e:
+        return f"Error executing {tool_name}: {type(e).__name__}: {e}"
+
+
 TOOL_REGISTRY: list[Tool] = [
     Tool(
         name="read_file",
@@ -372,9 +476,35 @@ TOOL_REGISTRY: list[Tool] = [
         },
         function=grep,
     ),
+    Tool(
+        name="bash",
+        description=(
+            "Run a non-interactive shell command in the workspace and wait for it "
+            "to finish. Use it to run tests, inspect git state, or execute build "
+            "commands. Dangerous commands require user confirmation."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "command": {
+                    "type": "string",
+                    "description": "The shell command to run",
+                },
+                "timeout": {
+                    "type": "integer",
+                    "description": "Timeout in seconds; maximum 30",
+                    "default": DEFAULT_BASH_TIMEOUT_SECONDS,
+                },
+            },
+            "required": ["command"],
+        },
+        function=bash,
+        requires_confirmation=True,
+    ),
 ]
 
 
 # The API takes plain dictionaries; the registry keeps schemas and functions aligned.
 TOOLS = [tool.schema() for tool in TOOL_REGISTRY]
+TOOL_LOOKUP = {tool.name: tool for tool in TOOL_REGISTRY}
 TOOL_FUNCTIONS = {tool.name: tool.function for tool in TOOL_REGISTRY}

@@ -15,7 +15,7 @@ from typing import Any
 from anthropic import Anthropic
 
 from .config import Config
-from .tools import TOOL_FUNCTIONS, TOOLS
+from .tools import TOOLS, execute_tool
 
 EXIT_COMMANDS = {"/exit", "/quit"}
 
@@ -23,6 +23,22 @@ EXIT_COMMANDS = {"/exit", "/quit"}
 def text_of(content) -> str:
     """Join the text blocks of an assistant reply, skipping other block types (e.g. thinking)."""
     return "".join(block.text for block in content if block.type == "text")
+
+
+def confirm_tool(tool_name: str, tool_input: dict[str, Any]) -> bool:
+    """Ask before running tools whose policy requires user confirmation."""
+    print(f"\n⚠️  {tool_name} wants to run:")
+    if tool_name == "bash":
+        print(tool_input.get("command", ""))
+    else:
+        print(tool_input)
+
+    try:
+        answer = input("Allow this command? [y/N] ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return False
+    return answer in {"y", "yes"}
 
 
 def print_stream(stream) -> tuple[list[dict[str, Any]], str, dict[str, int]]:
@@ -150,13 +166,11 @@ def chat_loop(client: Anthropic, config: Config) -> None:
                         tool_input = block["input"]
                         tool_id = block["id"]
 
-                        if tool_name in TOOL_FUNCTIONS:
-                            try:
-                                result = TOOL_FUNCTIONS[tool_name](**tool_input)
-                            except Exception as e:
-                                result = f"Error executing {tool_name}: {type(e).__name__}: {e}"
-                        else:
-                            result = f"Error: unknown tool {tool_name}"
+                        result = execute_tool(
+                            tool_name,
+                            tool_input,
+                            confirm=confirm_tool,
+                        )
 
                         tool_results.append({
                             "type": "tool_result",

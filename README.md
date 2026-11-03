@@ -15,3 +15,13 @@ uv run scratch-agent --ping
 - `src/scratch_agent/`: agent code
 - `notes/dayNN.md`: daily learning notes
 - `evals/`: fixed evaluation tasks (from Day 5)
+
+## Evaluation
+
+```bash
+uv run scratch-agent --eval-list
+uv run scratch-agent --eval
+uv run scratch-agent --eval --eval-output /tmp/scratch-agent-eval.json
+```
+
+The Day 5 design notes are in [`docs/day05-design.md`](docs/day05-design.md).
